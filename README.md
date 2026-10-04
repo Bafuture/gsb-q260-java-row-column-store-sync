@@ -30,3 +30,71 @@ Pair-wise GSB 标注任务仓库（第 16 批 / 260）。
 1. 在本仓库中完成提示词要求的全部内容。
 2. `./mvnw -q verify` 必须通过。
 3. 完成后在所属分支（A 或 B）上提交，产物快照的父提交必须是初始环境快照。
+
+---
+
+# 实现说明
+
+## 架构
+
+```
+写入:  upsert/delete ──► RowStore(内存, O(1) 点写)
+                          │
+                          ▼
+                     SyncQueue(WAL 追加落盘 + ack 位点)
+                          │  异步单线程按 seq 消费
+                          ▼
+                     ColumnStore(按主键范围分批, 批次快照写穿落盘)
+```
+
+| 类 | 职责 |
+|---|---|
+| `RowStore` | 行存：按主键插入/更新/删除，删除留墓碑 |
+| `ChangeEvent` | 变更事件，单调递增 `seq` 标识顺序 |
+| `SyncQueue` | WAL（`queue/wal.log`）+ 消费位点（`queue/sync.ack`） |
+| `SyncEngine` | 后台线程消费队列，幂等应用到列存后推进 ack |
+| `ColumnStore` | 列存：`key / batchSize` 分批，批次可单独重建 |
+| `ConsistencyChecker` | 范围比对，输出不一致主键与字段 |
+| `SyncMetrics` | 同步条数、延迟分布、不一致条数、重建次数 |
+| `DualStore` | 门面，串起写入/查询/检查/重建/恢复 |
+
+## 延迟与一致的取舍
+
+行存写入同步返回（只写内存 + WAL 追加），列存由后台线程异步追平：
+
+- **低写延迟、高吞吐**：写路径不等待列存，列存应用失败不影响行存可用性；
+- **代价是最终一致**：写入到列存可见之间存在同步延迟（毫秒级，见 `SyncMetrics.latencyDistribution()`）；
+- 读一致性要求高的场景应读行存；批量分析读列存，可接受秒级内的滞后；
+- 一致性检查通过**判定窗口**把这段正常滞后排除在"不一致"之外（见下）。
+
+## 一致性检查与判定窗口
+
+`checkConsistency(from, to)` 对范围内每个主键，满足以下任一条件即视为"在途"而跳过（计入 `skippedInFlight`，不算不一致）：
+
+1. 行存该键最新变更 `seq > 当前 ack` —— 事件还在同步队列里；
+2. 最后修改时间距今 `< lagToleranceMillis` —— 变更刚发生；
+3. 所在列存批次处于 `REBUILDING` —— 重建期间旧批次滞后属正常状态。
+
+越过窗口仍对不上的才输出：主键 + 类型（`MISSING_IN_COLUMN` / `MISSING_IN_ROW` / `FIELD_MISMATCH`）+ 逐字段的 `[行存值, 列存值]` 差异。
+
+## 批次重建
+
+`rebuildBatch(batchId)` 只重建指定批次：先从行存构建新快照（期间批次标记 `REBUILDING`，查询仍返回旧批次数据），再在批次锁内按 `seq` 合并并发期间落到旧批次的变更（含删除墓碑），最后原子切换并落盘。其他批次完全不受影响。
+
+## 崩溃恢复
+
+- WAL 同步刷盘后才对引擎可见；崩溃导致的截断尾记录在加载时丢弃；
+- 重启时：WAL 全量重放重建行存内存状态 → 列存批次从磁盘快照加载 → 引擎重放 `seq > ack` 的事件补齐；
+- 列存应用按 `seq` 幂等（`seq` 不新于已应用记录即跳过），因此"已应用、ack 未落盘"的事件重放不会重复生效 —— **补齐且不重复应用**。
+
+## 统计
+
+`SyncMetrics` 提供：`appliedCount`（同步条数）、`duplicateCount`（幂等去重条数）、`latencyDistribution()`（入队到应用的延迟分布直方图）、`inconsistencyCount`（累计不一致条数）、`rebuildCount`（重建次数）。
+
+## 测试
+
+`src/test/java/com/example/gsb/sync/` 下 15 个用例覆盖：行存更新触发同步、一致性检查（含字段级差异与判定窗口）、批次重建（含重建中查询）、崩溃恢复补齐与幂等、并发误判避免（重建 + 写压下无假阳性）、统计指标。
+
+```bash
+./mvnw -q verify
+```
